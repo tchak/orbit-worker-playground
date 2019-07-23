@@ -11,7 +11,9 @@ import {
   SourceSettings,
   Query,
   queryable,
-  Queryable
+  Queryable,
+  Updatable,
+  updatable
 } from '@orbit/data';
 import { fulfillInSeries, settleInSeries } from '@orbit/core';
 import { QueryResultData } from '@orbit/record-cache';
@@ -21,8 +23,8 @@ export interface BroadcastChannelSourceSettings extends SourceSettings {
   channel?: string;
 }
 
-interface TransformMessage {
-  type: 'transform';
+interface SyncMessage {
+  type: 'sync';
   transform: Transform;
 }
 
@@ -46,26 +48,10 @@ interface PushMessage {
   transform: Transform;
 }
 
-interface QueryResultMessage {
-  type: 'query-result';
-  id: string;
-  result?: QueryResultData;
-}
-
-interface PullResultMessage {
-  type: 'pull-result';
-  id: string;
-}
-
-interface UpdateResultMessage {
-  type: 'update-result';
+interface SuccessMessage {
+  type: 'success';
   id: string;
   result?: QueryResultData | QueryResultData[];
-}
-
-interface PushResultMessage {
-  type: 'push-result';
-  id: string;
 }
 
 interface ErrorMessage {
@@ -74,18 +60,22 @@ interface ErrorMessage {
   error: Error;
 }
 
-type Message = TransformMessage | QueryMessage | PullMessage | UpdateMessage | PushMessage | QueryResultMessage | PullResultMessage | UpdateResultMessage | PushResultMessage | ErrorMessage;
-type Resolve = (result?: QueryResultData | QueryResultData[]) => void;
+type Message = SyncMessage | QueryMessage | PullMessage | UpdateMessage | PushMessage | SuccessMessage | ErrorMessage;
+type Resolver = {
+  resolve: (result?: QueryResultData | QueryResultData[]) => void;
+  reject: (error: Error) => void;
+};
 
-@pullable
 @pushable
+@updatable
+@pullable
 @syncable
 @queryable
 export default class BroadcastChannelSource extends Source
-  implements Pushable, Pullable, Syncable, Queryable {
+  implements Pushable, Updatable, Pullable, Syncable, Queryable {
   channel: BroadcastChannel<Message>;
   protected _channelName: string;
-  protected _requests: Record<string, Resolve>;
+  protected _requests: Record<string, Resolver>;
 
   // Pushable interface stubs
   push: (
@@ -93,6 +83,13 @@ export default class BroadcastChannelSource extends Source
     options?: object,
     id?: string
   ) => Promise<Transform[]>;
+
+  // Updatable interface stubs
+  update: (
+    transformOrOperations: TransformOrOperations,
+    options?: object,
+    id?: string
+  ) => Promise<any>;
 
   // Pullable interface stubs
   pull: (
@@ -128,11 +125,28 @@ export default class BroadcastChannelSource extends Source
         transform
       });
 
-      await new Promise(resolve => {
-        this._requests[transform.id] = resolve;
+      await new Promise((resolve, reject) => {
+        this._requests[transform.id] = { resolve, reject };
       });
     }
     return [];
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Updatable interface implementation
+  /////////////////////////////////////////////////////////////////////////////
+  async _update(transform: Transform): Promise<any> {
+    if (!this.transformLog.contains(transform.id)) {
+      await this.channel.postMessage({
+        type: 'update',
+        transform
+      });
+
+      return new Promise((resolve, reject) => {
+        this._requests[transform.id] = { resolve, reject };
+      });
+    }
+    return;
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -144,8 +158,8 @@ export default class BroadcastChannelSource extends Source
       query
     });
 
-    await new Promise(resolve => {
-      this._requests[query.id] = resolve;
+    await new Promise((resolve, reject) => {
+      this._requests[query.id] = { resolve, reject };
     });
     return [];
   }
@@ -160,8 +174,8 @@ export default class BroadcastChannelSource extends Source
       query
     });
 
-    return new Promise(resolve => {
-      this._requests[query.id] = resolve;
+    return new Promise((resolve, reject) => {
+      this._requests[query.id] = { resolve, reject };
     });
   }
 
@@ -172,7 +186,7 @@ export default class BroadcastChannelSource extends Source
   async _sync(transform: Transform): Promise<void> {
     if (!this.transformLog.contains(transform.id)) {
       await this.channel.postMessage({
-        type: 'transform',
+        type: 'sync',
         transform
       });
       await this.transformed([transform]);
@@ -190,7 +204,7 @@ export default class BroadcastChannelSource extends Source
       await settleInSeries(this, 'proxyQuery', query, result);
 
       await this.channel.postMessage({
-        type: 'query-result',
+        type: 'success',
         id: query.id,
         result
       });
@@ -206,7 +220,7 @@ export default class BroadcastChannelSource extends Source
     }
   };
 
-  protected async __proxyPull__(query: Query): Promise<any> {
+  protected async __proxyPull__(query: Query): Promise<Transform[]> {
     try {
       const hints: any = {};
 
@@ -215,7 +229,7 @@ export default class BroadcastChannelSource extends Source
       await settleInSeries(this, 'proxyPull', query, []);
 
       await this.channel.postMessage({
-        type: 'pull-result',
+        type: 'success',
         id: query.id
       });
       return [];
@@ -229,6 +243,63 @@ export default class BroadcastChannelSource extends Source
       });
     }
   };
+
+  protected async __proxyUpdate__(transform: Transform): Promise<any> {
+    if (this.transformLog.contains(transform.id)) {
+      return [];
+    }
+
+    try {
+      const hints: any = {};
+      await fulfillInSeries(this, 'beforeUpdate', transform, hints);
+
+      const result = hints && hints.data;
+
+      await settleInSeries(this, 'proxyUpdate', transform, result);
+
+      await this.channel.postMessage({
+        type: 'success',
+        id: transform.id,
+        result
+      });
+      return result;
+    } catch (error) {
+      await settleInSeries(this, 'updateFail', transform, error);
+
+      await this.channel.postMessage({
+        type: 'error',
+        id: transform.id,
+        error
+      });
+    }
+  }
+
+  protected async __proxyPush__(transform: Transform): Promise<Transform[]> {
+    if (this.transformLog.contains(transform.id)) {
+      return [];
+    }
+
+    try {
+      const hints: any = {};
+      await fulfillInSeries(this, 'beforePush', transform, hints);
+
+      await settleInSeries(this, 'proxyPush', transform, []);
+
+      await this.channel.postMessage({
+        type: 'success',
+        id: transform.id
+      });
+      return [];
+    } catch (error) {
+      await settleInSeries(this, 'pushFail', transform, error);
+
+      await this.channel.postMessage({
+        type: 'error',
+        id: transform.id,
+        error
+      });
+    }
+  }
 
   async _activate(): Promise<void> {
     await super._activate();
@@ -247,7 +318,7 @@ export default class BroadcastChannelSource extends Source
 
   protected handleMessage(message: Message) {
     switch(message.type) {
-    case 'transform':
+    case 'sync':
       this.sync(message.transform);
       break;
     case 'query':
@@ -256,21 +327,29 @@ export default class BroadcastChannelSource extends Source
     case 'pull':
       this._requestQueue.push({ type: 'proxyPull', data: message.query });
       break;
-    case 'query-result':
-    case 'update-result':
+    case 'update':
+      this._requestQueue.push({ type: 'proxyUpdate', data: message.transform });
+      break;
+    case 'push':
+      this._requestQueue.push({ type: 'proxyPush', data: message.transform });
+      break;
+    case 'success':
       this.resolveRequest(message.id, message.result);
       break;
-    case 'pull-result':
-    case 'push-result':
-      this.resolveRequest(message.id);
-      break;
     case 'error':
-      throw message.error;
+      this.rejectRequest(message.id, message.error);
     }
   }
 
   protected resolveRequest(requestId: string, result?: QueryResultData | QueryResultData[]) {
-    this._requests[requestId](result);
+    const { resolve } = this._requests[requestId];
     delete this._requests[requestId];
+    resolve(result);
+  }
+
+  protected rejectRequest(requestId: string, error: Error) {
+    const { reject } = this._requests[requestId];
+    delete this._requests[requestId];
+    reject(error);
   }
 }
