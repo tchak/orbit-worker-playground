@@ -1,0 +1,19 @@
+{
+  "name": "orbit-worker-playground",
+  "version": "0.0.0",
+  "main": "src/index.ts",
+  "license": "MIT",
+  "devDependencies": {
+    "parcel-bundler": "^1.12.3",
+    "typescript": "^3.5.3"
+  },
+  "dependencies": {
+    "@orbit/coordinator": "0.16.0-beta.11",
+    "@orbit/jsonapi": "0.16.0-beta.11",
+    "@orbit/memory": "0.16.0-beta.11",
+    "broadcast-channel": "^2.1.12"
+  },
+  "scripts": {
+    "start": "yarn parcel index.html"
+  }
+}
