@@ -13,6 +13,8 @@ import {
   queryable,
   Queryable
 } from '@orbit/data';
+import { fulfillInSeries, settleInSeries } from '@orbit/core';
+import { QueryResultData } from '@orbit/record-cache';
 import BroadcastChannel from 'broadcast-channel';
 
 export interface BroadcastChannelSourceSettings extends SourceSettings {
@@ -29,14 +31,51 @@ interface QueryMessage {
   query: Query;
 }
 
-interface ResultMessage {
-  type: 'result';
+interface PullMessage {
+  type: 'pull';
   query: Query;
-  hints: any;
 }
 
-type Message = TransformMessage | QueryMessage | ResultMessage;
-type Resolve = (transforms: Transform[]) => void;
+interface UpdateMessage {
+  type: 'update';
+  transform: Transform;
+}
+
+interface PushMessage {
+  type: 'push';
+  transform: Transform;
+}
+
+interface QueryResultMessage {
+  type: 'query-result';
+  id: string;
+  result?: QueryResultData;
+}
+
+interface PullResultMessage {
+  type: 'pull-result';
+  id: string;
+}
+
+interface UpdateResultMessage {
+  type: 'update-result';
+  id: string;
+  result?: QueryResultData | QueryResultData[];
+}
+
+interface PushResultMessage {
+  type: 'push-result';
+  id: string;
+}
+
+interface ErrorMessage {
+  type: 'error';
+  id: string;
+  error: Error;
+}
+
+type Message = TransformMessage | QueryMessage | PullMessage | UpdateMessage | PushMessage | QueryResultMessage | PullResultMessage | UpdateResultMessage | PushResultMessage | ErrorMessage;
+type Resolve = (result?: QueryResultData | QueryResultData[]) => void;
 
 @pullable
 @pushable
@@ -85,11 +124,13 @@ export default class BroadcastChannelSource extends Source
   async _push(transform: Transform): Promise<Transform[]> {
     if (!this.transformLog.contains(transform.id)) {
       await this.channel.postMessage({
-        type: 'transform',
+        type: 'push',
         transform
       });
-      await this.transformed([transform]);
-      return [transform];
+
+      await new Promise(resolve => {
+        this._requests[transform.id] = resolve;
+      });
     }
     return [];
   }
@@ -99,7 +140,7 @@ export default class BroadcastChannelSource extends Source
   /////////////////////////////////////////////////////////////////////////////
   async _pull(query: Query): Promise<Transform[]> {
     await this.channel.postMessage({
-      type: 'query',
+      type: 'pull',
       query
     });
 
@@ -107,6 +148,21 @@ export default class BroadcastChannelSource extends Source
       this._requests[query.id] = resolve;
     });
     return [];
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Queryable interface implementation
+  /////////////////////////////////////////////////////////////////////////////
+
+  async _query(query) {
+    await this.channel.postMessage({
+      type: 'query',
+      query
+    });
+
+    return new Promise(resolve => {
+      this._requests[query.id] = resolve;
+    });
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -123,21 +179,56 @@ export default class BroadcastChannelSource extends Source
     }
   }
 
-  /////////////////////////////////////////////////////////////////////////////
-  // Queryable interface implementation
-  /////////////////////////////////////////////////////////////////////////////
+  protected async __proxyQuery__(query: Query): Promise<any> {
+    try {
+      const hints: any = {};
 
-  async _query(query, hints) {
-    if (hints && hints.data) {
+      await fulfillInSeries(this, 'beforeQuery', query, hints);
+
+      const result = hints && hints.data;
+
+      await settleInSeries(this, 'proxyQuery', query, result);
+
       await this.channel.postMessage({
-        type: 'result',
-        query,
-        hints
+        type: 'query-result',
+        id: query.id,
+        result
       });
-      return hints.data;
+      return result;
+    } catch (error) {
+      await settleInSeries(this, 'queryFail', query, error);
+
+      await this.channel.postMessage({
+        type: 'error',
+        id: query.id,
+        error
+      });
     }
-    return undefined;
-  }
+  };
+
+  protected async __proxyPull__(query: Query): Promise<any> {
+    try {
+      const hints: any = {};
+
+      await fulfillInSeries(this, 'beforePull', query, hints);
+
+      await settleInSeries(this, 'proxyPull', query, []);
+
+      await this.channel.postMessage({
+        type: 'pull-result',
+        id: query.id
+      });
+      return [];
+    } catch (error) {
+      await settleInSeries(this, 'pullFail', query, error);
+
+      await this.channel.postMessage({
+        type: 'error',
+        id: query.id,
+        error
+      });
+    }
+  };
 
   async _activate(): Promise<void> {
     await super._activate();
@@ -145,17 +236,7 @@ export default class BroadcastChannelSource extends Source
       webWorkerSupport: true
     });
     this.channel.addEventListener('message', (message: Message): void => {
-      switch(message.type) {
-      case 'transform':
-        this.sync(message.transform);
-        break;
-      case 'query':
-        this.query(message.query);
-        break;
-      case 'result':
-        this.sendResult(message.query, message.hints);
-        break;
-      }
+      this.handleMessage(message);
     });
   }
 
@@ -164,7 +245,32 @@ export default class BroadcastChannelSource extends Source
     await super.deactivate();
   }
 
-  protected sendResult(query: Query, hints: any) {
-    this._requests[query.id](hints);
+  protected handleMessage(message: Message) {
+    switch(message.type) {
+    case 'transform':
+      this.sync(message.transform);
+      break;
+    case 'query':
+      this._requestQueue.push({ type: 'proxyQuery', data: message.query });
+      break;
+    case 'pull':
+      this._requestQueue.push({ type: 'proxyPull', data: message.query });
+      break;
+    case 'query-result':
+    case 'update-result':
+      this.resolveRequest(message.id, message.result);
+      break;
+    case 'pull-result':
+    case 'push-result':
+      this.resolveRequest(message.id);
+      break;
+    case 'error':
+      throw message.error;
+    }
+  }
+
+  protected resolveRequest(requestId: string, result?: QueryResultData | QueryResultData[]) {
+    this._requests[requestId](result);
+    delete this._requests[requestId];
   }
 }

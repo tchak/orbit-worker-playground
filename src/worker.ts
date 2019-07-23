@@ -14,8 +14,7 @@ export default async function Worker(schema: Schema) {
   const eventLog = new EventLoggingStrategy({ logPrefix: '[Worker]'});
   const syncFromRemote = new SyncStrategy({
     source: 'jsonapi',
-    target: 'broadcast',
-    blocking: true
+    target: 'broadcast'
   });
   const syncToRemote = new SyncStrategy({
     source: 'broadcast',
@@ -27,7 +26,7 @@ export default async function Worker(schema: Schema) {
     on: 'beforeQuery',
 
     target: 'jsonapi',
-    action: 'pull',
+    action: 'query',
 
     blocking: true,
     passHints: true

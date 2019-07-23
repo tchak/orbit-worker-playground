@@ -10,17 +10,17 @@ export default async function Main(schema: Schema) {
   const eventLog = new EventLoggingStrategy({ logPrefix: '[Main]' });
   const syncToMemory = new SyncStrategy({
     source: 'broadcast',
-    target: 'memory',
-    blocking: true
+    target: 'memory'
   });
   const query = new RequestStrategy({
     source: 'memory',
     on: 'beforeQuery',
 
     target: 'broadcast',
-    action: 'pull',
+    action: 'query',
 
-    blocking: true
+    blocking: true,
+    passHints: true
   });
   const update = new RequestStrategy({
     source: 'memory',
@@ -29,7 +29,7 @@ export default async function Main(schema: Schema) {
     target: 'broadcast',
     action: 'push',
 
-    blocking: false
+    blocking: true
   });
 
   const coordinator = new Coordinator({
